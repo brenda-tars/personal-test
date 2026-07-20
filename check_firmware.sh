@@ -8,6 +8,7 @@
 # 用法:
 #   ./check_firmware.sh                 # 交互模式
 #   ./check_firmware.sh --use-default   # 后续交互项自动使用各自默认值
+#   ./check_firmware.sh --check-only    # 仅检测版本，不下载/不刷写/不 apply
 #   ./check_firmware.sh -h              # 帮助
 #
 # 退出码:
@@ -24,22 +25,31 @@ WHITE='\033[34m'
 YELLOW='\033[33m'
 NO_COLOR='\033[0m'
 USE_DEFAULT_OPTIONS=1   # 1: 后续交互项自动使用各自默认值
+CHECK_ONLY=0            # 1: 仅检测版本，不下载/不刷写/不 apply（--check-only）
 PACKAGE_DIR="/mnt/gaea/package"
-OTA_FILE="$(dirname "${BASH_SOURCE[0]}")/ota.py"
+OTA_FILE="$(dirname "${BASH_SOURCE[0]}")/firmware_ota.py"
 if [ ! -f "$OTA_FILE" ]; then
     echo "错误: 找不到OTA工具文件 $OTA_FILE" >&2
     exit 1
 fi
+
+VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/firmware_version.txt"
+if [ ! -f "$VERSION_FILE" ]; then
+    echo "错误: 找不到版本配置文件 $VERSION_FILE" >&2
+    exit 1
+fi
+
 # base_name=$(basename "${ARCHIVE%.install.tar}")
 # BASE_OUTPUT_DIR="${PACKAGE_DIR}/${base_name}_output"
 # OUTPUT_DIR="${PACKAGE_DIR}/${base_name}_output/output"
 
 
 show_help() {
-    echo "Usage: $0 [--use-default] [-h|--help]"
+    echo "Usage: $0 [--use-default] [--check-only] [-h|--help]"
     echo ""
     echo "Options:"
     echo "  --use-default   后续交互项自动使用各自默认值"
+    echo "  --check-only    仅检测版本，不下载/不刷写/不 apply（别名 --no-download）"
     echo "  -h, --help      显示帮助信息"
 }
 
@@ -48,6 +58,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --use-default)
             USE_DEFAULT_OPTIONS=1
+            shift
+            ;;
+        --check-only|--no-download)
+            CHECK_ONLY=1
             shift
             ;;
         -h|--help)
@@ -61,13 +75,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/firmware_version.txt"
-
-if [ ! -f "$VERSION_FILE" ]; then
-    echo "错误: 找不到版本配置文件 $VERSION_FILE" >&2
-    exit 1
-fi
 
 # 从配置文件中解析特定的变量值，避免直接 source 整个文本文件
 get_var_from_file() {
@@ -191,7 +198,17 @@ prompt_power_cycle_if_firmware_flashed() {
     fi
 }
 
-check_soc_firmware() { 
+# 探测失败/版本不符时的统一提示。正常模式打印“将自动下载”并返回 0（继续走下载/刷写）；
+# check-only 模式打印“仅检测不下载”并返回 1（调用方据此终止，不下载/不刷写）。
+probe_fail_msg() {  # $1 = 固件标签
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        echo -e "${YELLOW}ℹ️ check-only 模式：仅检测，不下载/不刷写 ${1} 固件${NO_COLOR}"
+        return 1
+    fi
+    return 0
+}
+
+check_soc_firmware() {
     echo "=========================================="
     echo "🔌 校验 thor-soc 镜像版本"
     echo "=========================================="
@@ -204,6 +221,9 @@ check_soc_firmware() {
 
     if [ -z "$soc_version" ] || [ "$soc_version" != "$EXPECTED_SOC_VERSION" ]; then
         echo -e "${RED}❌ SOC 镜像版本不符 ${NO_COLOR}"
+        if [ "$CHECK_ONLY" -eq 1 ]; then
+            probe_fail_msg "thor-soc" || return 0
+        fi
         if [ "$USE_DEFAULT_OPTIONS" -eq 1 ]; then
             echo -e "${YELLOW}是否自动从 ${THOR_IMAGES_DOWNLOAD_URL} 下载对应版本固件? [默认模式: y]${NO_COLOR}"
         else
@@ -271,7 +291,7 @@ check_mcu_firmware() {
 
     if [ "$probe_rc" -eq 124 ]; then
         echo -e "${RED}❌ MCU 探测超时（工具未在 30s 内返回）${NO_COLOR}"
-        echo -e "${RED}   将自动为您下载并更新 thor-mcu 固件 ${NO_COLOR}"
+        probe_fail_msg "thor-mcu" || return 0
     else
         # 解析新版探测输出：从输出中获取是否 probe OK 以及固件版本号
         local ok_val="0"
@@ -284,10 +304,10 @@ check_mcu_firmware() {
         # ok!=1：通常为 ACK 超时（reason 已在上方原样打印）
         if [ "$ok_val" != "1" ]; then
             echo -e "${RED}❌ MCU 探测失败 (ok=${ok_val:-未知})，可能为通信/ACK 超时${NO_COLOR}"
-            echo -e "${RED}   将自动为您下载并更新 thor-mcu 固件 ${NO_COLOR}"
+            probe_fail_msg "thor-mcu" || return 0
         elif [ -z "$mcu_version" ]; then
             echo -e "${RED}❌ 探测返回 ok=1 但未解析到版本号${NO_COLOR}"
-            echo -e "${RED}   将自动为您下载并更新 thor-mcu 固件 ${NO_COLOR}"
+            probe_fail_msg "thor-mcu" || return 0
         else
             echo -e "${GREEN}✅ MCU 探测成功:${NO_COLOR}"
             echo "📟 当前 MCU 版本: $mcu_version （期望版本应含关键字: $EXPECTED_MCU_VERSION_KEYWORD）"
@@ -296,6 +316,9 @@ check_mcu_firmware() {
                 return 0
             else
                 echo -e "${RED}❌ MCU 固件版本不符 ${NO_COLOR}"
+                if [ "$CHECK_ONLY" -eq 1 ]; then
+                    probe_fail_msg "thor-mcu" || return 0
+                fi
                 if [ "$USE_DEFAULT_OPTIONS" -eq 1 ]; then
                     echo -e "${YELLOW}是否自动从 ${THOR_IMAGES_DOWNLOAD_URL} 下载对应版本固件? [默认模式: y]${NO_COLOR}"
                 else
@@ -373,21 +396,25 @@ check_pmu_firmware() {
 
     if [ "$probe_rc" -eq 124 ]; then
         echo -e "${RED}❌ PMU 版本探测超时（工具未在 30s 内返回）${NO_COLOR}"
-        echo -e "${RED}   将自动为您下载并更新 PMU 固件${NO_COLOR}"
+        probe_fail_msg "PMU" || return 0
     elif [ "$probe_rc" -ne 0 ]; then
         echo -e "${RED}❌ PMU 版本探测失败 (exit=${probe_rc})${NO_COLOR}"
-        echo -e "${RED}   将自动为您下载并更新 PMU 固件${NO_COLOR}"
+        probe_fail_msg "PMU" || return 0
     else
         pmu_version=$(echo "$pmu_version" | grep -E '^[vV][0-9]' | tr -d '\r' \
             | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 
         if [ -z "$pmu_version" ]; then
             echo -e "${RED}❌ PMU 探测未返回版本号${NO_COLOR}"
-            echo -e "${RED}   将自动为您下载并更新 PMU 固件${NO_COLOR}"
+            probe_fail_msg "PMU" || return 0
         else
             echo "📟 当前 PMU 版本: $pmu_version （要求: $EXPECTED_PMU_FIRMWARE_VERSION）"
             if [ "${pmu_version,,}" != "${EXPECTED_PMU_FIRMWARE_VERSION,,}" ]; then
                 echo -e "${RED}❌ PMU 固件版本不符（当前 '$pmu_version'，要求 '$EXPECTED_PMU_FIRMWARE_VERSION'）${NO_COLOR}"
+
+                if [ "$CHECK_ONLY" -eq 1 ]; then
+                    probe_fail_msg "PMU" || return 0
+                fi
 
                 if [ "$USE_DEFAULT_OPTIONS" -eq 1 ]; then
                     echo -e "${YELLOW}是否自动从 ${THOR_IMAGES_DOWNLOAD_URL} 下载对应版本固件? [默认模式: y]${NO_COLOR}"
@@ -468,6 +495,9 @@ if [ "$USE_DEFAULT_OPTIONS" -eq 1 ]; then
     echo "⚙️ 默认值模式 (--use-default)"
 else
     echo "👤 交互模式"
+fi
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    echo "🔍 check-only 模式（仅检测，不下载/不刷写）"
 fi
 echo "=========================================="
 echo ""

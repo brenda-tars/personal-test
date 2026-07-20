@@ -1014,6 +1014,7 @@ import argparse
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 from collections import deque
@@ -1562,8 +1563,9 @@ class ThorCanHost:
                     )
                 return True
             except OSError as exc:
+                # 绑定失败属错误，即便 quiet（--get-version/--apply）也打到 stderr，便于诊断
+                print(f"{Fore.RED}✗ UDP 绑定失败: {exc}", file=sys.stderr)
                 if not self.quiet:
-                    print(f"{Fore.RED}✗ UDP 绑定失败: {exc}")
                     print(
                         f"{Fore.YELLOW}提示: 40189 若被 power_udp_daemon 占用，"
                         f"请先停 daemon 或换 --listen-port"
@@ -2380,6 +2382,12 @@ def run_get_version_probe(host: "ThorCanHost") -> int:
     try:
         version = host.fetch_firmware_version()
         if version is None:
+            print(
+                f"{Fore.RED}✗ 未收到 GET_ID 应答（5s 超时）："
+                f"MCU({host.mcu_ip}:{host.mcu_port}) 的 PMU-CAN 桥可能未在线/未重启，"
+                f"或 PMU 电源板无响应",
+                file=sys.stderr,
+            )
             return 1
         print(version)
         return 0
@@ -2701,6 +2709,24 @@ def setup_network(iface: str = DEFAULT_IFACE) -> None:
     if result.returncode != 0:
         raise OtaError(
             f"ip route replace failed: {(result.stderr or result.stdout).strip()}"
+        )
+
+
+def teardown_network(iface: str = DEFAULT_IFACE) -> None:
+    """还原 setup_network 的副作用：删除它加的 {MCU_IP}/32 主机路由。
+
+    不删 LOCAL_IP 地址（可能是系统既有的；地址本身不劫持路由，对其它工具无害）。
+    删这条主机路由是为了让后续走默认路由的工具（如 PMU get-version，它要经 MCU
+    的 PMU-CAN 桥）不被 lan0 路径劫持而 5s 超时。失败静默（路由可能已不存在）。
+    """
+    for spec in (
+        [f"{MCU_IP}/32", "dev", iface, "src", LOCAL_IP],
+        [f"{MCU_IP}/32", "dev", iface],
+    ):
+        subprocess.run(
+            ["sudo", "ip", "route", "del", *spec],
+            capture_output=True,
+            text=True,
         )
 
 
@@ -3491,9 +3517,11 @@ def rh850_main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
+    net_setup = False
     try:
         if not args.self_test and not args.dry_run:
             setup_network(args.iface or DEFAULT_IFACE)
+            net_setup = True
 
         if args.self_test:
             run_crc_self_test()
@@ -3544,6 +3572,9 @@ def rh850_main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
+    finally:
+        if net_setup:
+            teardown_network(args.iface or DEFAULT_IFACE)
 
 
 

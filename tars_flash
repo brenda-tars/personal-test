@@ -1,0 +1,866 @@
+#!/bin/bash
+# =============================================================================
+# DriveOS A/B 分区备份/恢复工具
+#
+# 用法: flash.sh -b <path>   备份当前分区到指定路径
+#       flash.sh -r <path>   从指定路径恢复到非活动分区
+#
+# 分区布局:
+#   vblkdev80p9 = Slot A
+#   vblkdev80p10 = Slot B
+#
+# 特性:
+#   - 自动识别当前活动/非活动分区
+#   - MD5 校验确保数据完整性
+#   - pigz 并行压缩/解压加速
+#   - 恢复后自动切换 slot 并重启（可用 --no-reboot 跳过重启）
+# =============================================================================
+set -euo pipefail
+
+# --------------- 配置 ---------------
+PART_A="/dev/vblkdev80p9"
+PART_B="/dev/vblkdev80p10"
+SLOT_A_MARKER="res_a"
+SLOT_B_MARKER="res_b"
+
+# 恢复后是否跳过重启（由 --no-reboot 置位）
+NO_REBOOT=false
+
+# 备份活动分区时被 fsfreeze 冻结的挂载点（供 trap 兜底解冻使用，空=未冻结）
+FROZEN_MP=""
+
+# bsp_param 分区（vblkdev73，16 MiB raw partition，无文件系统）
+# 备份时与 res 一并导出，文件名形如 <res>.bsp_param.img.gz
+# 恢复时默认 *不* 写回 —— 该分区由 BSP 流程维护，复写需显式 --with-bsp-param
+BSP_PARAM_PART="/dev/vblkdev73"
+BSP_PARAM_SUFFIX=".bsp_param.img.gz"
+
+# --------------- 颜色输出 ---------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log_info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+# --------------- 文件系统冻结（避免活动分区 dd 出撕裂快照）---------------
+# 活动分区在 dd 期间仍被读写，逐块拷贝会得到数据/日志不一致的“撕裂快照”，
+# 导致备份镜像 journal 校验失败、无法可写挂载。dd 前 fsfreeze -f 刷盘并挂起
+# 写入，dd 后 -u 解冻，即可得到一致镜像。解冻由 trap 兜底，避免异常退出后
+# 分区永久冻结导致系统卡死。
+#
+# 策略（严格模式）：源分区已挂载时，冻结是强制的——冻结不可用或被拒绝即返回
+# 非 0，由调用方中止备份并回滚，绝不“降级继续”导致撕裂镜像。
+# 返回码: 0=已冻结  1=参数为空  2=fsfreeze 不可用  3=冻结被拒绝
+freeze_fs() {
+    local mp="$1"
+    [ -z "$mp" ] && return 1
+    command -v fsfreeze &>/dev/null || return 2
+    sync
+    if fsfreeze -f "$mp" 2>/dev/null; then
+        FROZEN_MP="$mp"
+        log_info "  已冻结源文件系统: $mp"
+        return 0
+    fi
+    return 3
+}
+
+unfreeze_fs() {
+    [ -z "$FROZEN_MP" ] && return 0
+    if fsfreeze -u "$FROZEN_MP" 2>/dev/null; then
+        log_info "  已解冻源文件系统: $FROZEN_MP"
+    else
+        log_warn "  解冻 $FROZEN_MP 失败，请手动执行: fsfreeze -u $FROZEN_MP"
+    fi
+    FROZEN_MP=""
+}
+
+# 任何路径退出（含 set -e 中断、Ctrl-C、kill）都必须解冻，否则源分区永久挂起
+trap 'unfreeze_fs' EXIT INT TERM
+
+# --------------- 工具检测 ---------------
+detect_tools() {
+    log_info "检测可用工具..."
+    
+    # 优先使用 /mnt/ro 中的工具，否则使用系统工具
+    if [ -x "/mnt/ro/usr/bin/pigz" ]; then
+        PIGZ="/mnt/ro/usr/bin/pigz"
+    elif command -v pigz &>/dev/null; then
+        PIGZ="pigz"
+    else
+        PIGZ=""
+        log_warn "pigz 不可用，将使用 gzip（较慢）"
+    fi
+    
+    if [ -x "/mnt/ro/usr/bin/dd" ]; then
+        DD="/mnt/ro/usr/bin/dd"
+    else
+        DD="dd"
+    fi
+    
+    if [ -x "/mnt/ro/usr/bin/md5sum" ]; then
+        MD5SUM="/mnt/ro/usr/bin/md5sum"
+    else
+        MD5SUM="md5sum"
+    fi
+
+    if [ -x "/mnt/ro/usr/sbin/zerofree" ]; then
+        ZEROFREE="/mnt/ro/usr/sbin/zerofree"
+    elif command -v zerofree &>/dev/null; then
+        ZEROFREE="zerofree"
+    else
+        ZEROFREE=""
+    fi
+    
+    # 检测 pv（进度显示，可选）
+    if [ -x "/mnt/ro/usr/bin/pv" ]; then
+        PV="/mnt/ro/usr/bin/pv"
+    elif command -v pv &>/dev/null; then
+        PV="pv"
+    else
+        PV=""
+    fi
+    
+    log_info "  DD: $DD"
+    log_info "  MD5SUM: $MD5SUM"
+    log_info "  PIGZ: ${PIGZ:-gzip (fallback)}"
+    log_info "  PV: ${PV:-不可用}"
+    log_info "  ZEROFREE: ${ZEROFREE:-不可用}"
+}
+
+check_mount_with_marker() {
+    local part="$1"
+    local marker="$2"
+    mount | grep -q "^${part} on .*${marker}"
+}
+
+# --------------- 分区识别 ---------------
+detect_current_slot() {
+    log_info "检测当前活动分区..."
+    NO_ACTIVE_SLOT=false
+    
+    if [ ! -b "$PART_A" ]; then
+        log_error "未找到 Slot A 分区: $PART_A"
+        exit 1
+    fi
+    if [ ! -b "$PART_B" ]; then
+        log_error "未找到 Slot B 分区: $PART_B"
+        exit 1
+    fi
+    
+    # 方法1: 检查 mount 中的 res_a/res_b
+    if check_mount_with_marker "$PART_B" "$SLOT_B_MARKER"; then
+        CURRENT_SLOT="B"
+        CURRENT_PART="$PART_B"
+        INACTIVE_SLOT="A"
+        INACTIVE_PART="$PART_A"
+    elif check_mount_with_marker "$PART_A" "$SLOT_A_MARKER"; then
+        CURRENT_SLOT="A"
+        CURRENT_PART="$PART_A"
+        INACTIVE_SLOT="B"
+        INACTIVE_PART="$PART_B"
+    else
+        # 方法2: 从 hostname/PS1 提取 SLOT 信息
+        if [[ "$(hostname)" == *"SLOT_B"* ]] || [[ "${PS1:-}" == *"SLOT_B"* ]]; then
+            CURRENT_SLOT="B"
+            CURRENT_PART="$PART_B"
+            INACTIVE_SLOT="A"
+            INACTIVE_PART="$PART_A"
+        elif [[ "$(hostname)" == *"SLOT_A"* ]] || [[ "${PS1:-}" == *"SLOT_A"* ]]; then
+            CURRENT_SLOT="A"
+            CURRENT_PART="$PART_A"
+            INACTIVE_SLOT="B"
+            INACTIVE_PART="$PART_B"
+        else
+            # 方法3: 检查哪个分区被挂载
+            if mount | grep -q "$PART_B"; then
+                CURRENT_SLOT="B"
+                CURRENT_PART="$PART_B"
+                INACTIVE_SLOT="A"
+                INACTIVE_PART="$PART_A"
+            elif mount | grep -q "$PART_A"; then
+                CURRENT_SLOT="A"
+                CURRENT_PART="$PART_A"
+                INACTIVE_SLOT="B"
+                INACTIVE_PART="$PART_B"
+            else
+                # 未检测到活动分区，说明 rw overlay 未生效
+                # 直接以 Slot A 作为恢复目标
+                NO_ACTIVE_SLOT=true
+                CURRENT_SLOT=""
+                CURRENT_PART=""
+                INACTIVE_SLOT="A"
+                INACTIVE_PART="$PART_A"
+                log_warn "未检测到活动分区 (rw overlay 可能未生效)"
+                log_warn "将直接对 Slot A ($PART_A) 执行恢复"
+            fi
+        fi
+    fi
+    
+    # 获取分区大小（备份时使用 CURRENT_PART，恢复时使用 INACTIVE_PART）
+    local size_part="${CURRENT_PART:-$INACTIVE_PART}"
+    PART_SIZE=$(blockdev --getsize64 "$size_part")
+    PART_SIZE_GB=$(awk "BEGIN {printf \"%.2f\", $PART_SIZE / 1024 / 1024 / 1024}")
+    
+    if [ "${NO_ACTIVE_SLOT:-false}" = true ]; then
+        log_warn "活动分区: 未检测到"
+        log_ok "恢复目标:   Slot $INACTIVE_SLOT ($INACTIVE_PART)"
+    else
+        log_ok "当前活动分区: Slot $CURRENT_SLOT ($CURRENT_PART)"
+        log_ok "非活动分区:   Slot $INACTIVE_SLOT ($INACTIVE_PART)"
+    fi
+    log_info "分区大小: ${PART_SIZE_GB}GB ($PART_SIZE bytes)"
+}
+
+# --------------- 检查分区是否挂载 ---------------
+check_partition_mounted() {
+    local part="$1"
+    if mount | grep -q "^$part "; then
+        return 0  # mounted
+    else
+        return 1  # not mounted
+    fi
+}
+
+# --------------- 备份文件名前缀 ---------------
+# 取自 /etc/tars_fw_version 第一行（固件版本，如 thor_v5.2b）作为备份/恢复文件名前缀。
+# 清洗：去掉首尾空白、并把不适合做文件名的字符（空格、/ 等）替换为 _。
+# 文件缺失/为空时回退到 overlay 前缀并告警，避免备份因取不到版本号而中止。
+FW_VERSION_FILE="/etc/tars_fw_version"
+backup_prefix() {
+    local prefix=""
+    if [ -r "$FW_VERSION_FILE" ]; then
+        prefix=$(head -n1 "$FW_VERSION_FILE" 2>/dev/null \
+                 | tr -d '\r' \
+                 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                 | sed 's#[/[:space:]]\+#_#g')
+    fi
+    if [ -z "$prefix" ]; then
+        log_warn "无法从 $FW_VERSION_FILE 读取版本号，回退使用前缀 overlay" >&2
+        prefix="overlay"
+    fi
+    printf '%s' "$prefix"
+}
+
+# --------------- 备份操作 ---------------
+do_backup() {
+    if [ "${NO_ACTIVE_SLOT:-false}" = true ]; then
+        log_error "未检测到活动分区，无法执行备份"
+        exit 1
+    fi
+
+    local backup_path="$1"
+    local backup_dir
+    local backup_file
+    local md5_file
+    
+    # 处理路径
+    local fw_prefix
+    fw_prefix="$(backup_prefix)"
+    if [[ "$backup_path" == */ ]]; then
+        backup_dir="$backup_path"
+        backup_file="${backup_dir}${fw_prefix}_$(date +%Y%m%d_%H%M%S).img.gz"
+    elif [[ "$backup_path" == *.img.gz ]]; then
+        backup_file="$backup_path"
+        backup_dir="$(dirname "$backup_path")"
+    elif [[ "$backup_path" == *.img ]]; then
+        backup_file="${backup_path}.gz"
+        backup_dir="$(dirname "$backup_path")"
+    else
+        backup_dir="$backup_path"
+        mkdir -p "$backup_dir"
+        backup_file="${backup_dir}/${fw_prefix}_$(date +%Y%m%d_%H%M%S).img.gz"
+    fi
+    
+    md5_file="${backup_file}.md5"
+    
+    # 确保目录存在
+    mkdir -p "$backup_dir"
+    
+    local img_file="${backup_file%.gz}"
+    
+    log_info "=========================================="
+    log_info "备份当前活动分区 -> $backup_file"
+    log_info "=========================================="
+    
+    # 检查目标空间 (需要容纳原始镜像 + 压缩后文件)
+    local avail_space
+    avail_space=$(df -B1 "$backup_dir" | tail -1 | awk '{print $4}')
+    log_info "目标可用空间: $(awk "BEGIN {printf \"%.2f\", $avail_space / 1024 / 1024 / 1024}")GB"
+    
+    local start_time
+    start_time=$(date +%s)
+    
+    # Step 1: dd 导出分区为原始镜像
+    log_info "[1/4] dd 导出分区 (分区: $CURRENT_PART, 大小: ${PART_SIZE_GB}GB)..."
+
+    # 活动分区正被读写，dd 前必须冻结其文件系统以获得一致快照，避免撕裂。
+    # 输出目录在另一分区(p1)，与被冻结分区不同源，故不会自我死锁。
+    # 严格模式：源分区已挂载却无法冻结 -> 中止并回滚，绝不产出可能撕裂的镜像。
+    local src_mp=""
+    src_mp=$(findmnt -n -o TARGET --source "$CURRENT_PART" 2>/dev/null | head -1 || true)
+    if [ -n "$src_mp" ]; then
+        log_info "  冻结源文件系统以保证一致快照: $src_mp"
+        freeze_fs "$src_mp"
+        local frc=$?
+        if [ "$frc" -ne 0 ]; then
+            case "$frc" in
+                2) log_error "fsfreeze 不可用，无法保证一致快照，中止备份" ;;
+                3) log_error "冻结被拒绝（$src_mp 可能已冻结或不支持），中止备份" ;;
+                *) log_error "冻结源文件系统失败 (code=$frc)，中止备份" ;;
+            esac
+            rm -f "$img_file"   # 回滚：清除可能的残留输出
+            exit 1
+        fi
+        # 冻结已 sync 脏页落盘、磁盘成为权威且此后无新写入。此时丢弃干净缓存页
+        # （含块设备 buffer cache 里残留的陈旧块），强制下面的 dd 从磁盘重新读，
+        # 避免读到块设备缓存中某块的旧身份（如已被复用为 .so 的旧目录块）。
+        # drop_caches 只丢“干净”页、不写盘，必须放在 freeze(已flush) 之后才有效。
+        if [ -w /proc/sys/vm/drop_caches ]; then
+            sync   # 冗余保险：确保无遗留脏页后再丢缓存
+            echo 1 > /proc/sys/vm/drop_caches 2>/dev/null \
+                && log_info "  已丢弃干净缓存页 (drop_caches=1)，dd 将从磁盘直读" \
+                || log_warn "  drop_caches 写入失败，依赖 dd iflag=direct 兜底"
+        else
+            log_warn "  /proc/sys/vm/drop_caches 不可写，依赖 dd iflag=direct 兜底"
+        fi
+    else
+        log_info "  源分区未挂载（无写入者），镜像天然一致，直接 dd"
+    fi
+
+    # iflag=direct: dd 以 O_DIRECT 绕过块设备 buffer cache 直读磁盘，从根上消除
+    # “块设备缓存 vs 文件系统 page cache 对同一物理块不一致”导致的内容错位。
+    if [ -n "$PV" ]; then
+        $DD if="$CURRENT_PART" bs=4M iflag=direct status=none | $PV -s "$PART_SIZE" > "$img_file"
+    else
+        $DD if="$CURRENT_PART" bs=4M iflag=direct status=progress of="$img_file"
+    fi
+
+    unfreeze_fs
+    
+    # Step 2: 挂载并清理临时文件
+    log_info "[2/4] 挂载并清理镜像中的临时文件..."
+    # 严格模式：冻结后镜像本应一致，可写挂载应当成功。挂载失败说明镜像异常
+    # （撕裂/损坏），视为备份失败并回滚——不再 e2fsck 修复后重试。
+    if ! cleanup_raw_image "$img_file"; then
+        log_error "镜像挂载/清理失败（冻结后镜像本应一致），备份中止"
+        rm -f "$img_file"   # 回滚：删除不可信的原始镜像
+        exit 1
+    fi
+    
+    # Step 3: 压缩
+    log_info "[3/4] 压缩镜像..."
+    if [ -n "$PIGZ" ]; then
+        $PIGZ "$img_file"
+    else
+        gzip "$img_file"
+    fi
+    
+    # Step 4: 计算 MD5
+    log_info "[4/4] 生成 MD5 校验值..."
+    $MD5SUM "$backup_file" > "$md5_file"
+    
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # 显示结果
+    local backup_size
+    backup_size=$(ls -lh "$backup_file" | awk '{print $5}')
+    local md5_value
+    md5_value=$(cat "$md5_file" | awk '{print $1}')
+    
+    log_ok "=========================================="
+    log_ok "备份完成!"
+    log_ok "  文件: $backup_file"
+    log_ok "  大小: $backup_size"
+    log_ok "  MD5:  $md5_value"
+    log_ok "  耗时: ${duration}秒"
+    log_ok "=========================================="
+
+    # bsp_param (vblkdev73) — 与 res 一并备份，作为伴生文件
+    backup_bsp_param "$backup_file"
+}
+
+# --------------- 备份 bsp_param (vblkdev73) ---------------
+# 与 res 备份伴生：文件命名为 <res>.bsp_param.img.gz
+# 失败不致命 —— 主备份已完成，bsp_param 可后续单独处理
+backup_bsp_param() {
+    local res_file="$1"
+    local bp_base="${res_file%.img.gz}"
+    local bp_file="${bp_base}${BSP_PARAM_SUFFIX}"
+    local bp_md5="${bp_file}.md5"
+    local bp_raw="${bp_file%.gz}"
+
+    log_info "------ 备份 bsp_param ($BSP_PARAM_PART) ------"
+    if [ ! -b "$BSP_PARAM_PART" ]; then
+        log_warn "未找到 $BSP_PARAM_PART，跳过 bsp_param 备份"
+        return 0
+    fi
+
+    sync
+    if ! $DD if="$BSP_PARAM_PART" bs=4M status=none of="$bp_raw" 2>/dev/null; then
+        log_warn "bsp_param 导出失败，跳过"
+        rm -f "$bp_raw"
+        return 0
+    fi
+
+    if [ -n "$PIGZ" ]; then
+        $PIGZ "$bp_raw"
+    else
+        gzip "$bp_raw"
+    fi
+    $MD5SUM "$bp_file" > "$bp_md5"
+
+    local bp_size bp_hash
+    bp_size=$(ls -lh "$bp_file" | awk '{print $5}')
+    bp_hash=$(awk '{print $1}' "$bp_md5")
+    log_ok "  bsp_param: $bp_file ($bp_size, md5 ${bp_hash:0:12}...)"
+}
+
+# --------------- 清理原始镜像 ---------------
+cleanup_raw_image() {
+    local img_file="$1"
+    local mount_point
+    mkdir -p /mnt/gaea/tmp
+    mount_point=$(mktemp -d /mnt/gaea/tmp/flash_cleanup.XXXXXX)
+
+    # 检测文件系统类型
+    local fstype=""
+    if command -v blkid &>/dev/null; then
+        fstype=$(blkid -o value -s TYPE "$img_file" 2>/dev/null || true)
+        log_info "  检测到文件系统类型: ${fstype:-未知}"
+    fi
+    if [ -z "$fstype" ] && command -v file &>/dev/null; then
+        local file_info
+        file_info=$(file -s "$img_file" 2>/dev/null || true)
+        log_info "  文件类型: $file_info"
+    fi
+
+    # 冻结后 dd 出来的镜像本应一致（journal 干净）。此处只做只读 sanity check，
+    # 绝不 e2fsck 自动修复：-fy 在不一致 image 上会 clear 看似悬挂的 inode，让备份
+    # 里的文件凭空消失。若镜像真有问题，交由下面的挂载这一步把关并判为失败。
+    if [ "$fstype" = "ext4" ] || [ "$fstype" = "ext3" ] || [ "$fstype" = "ext2" ]; then
+        log_info "  检查文件系统 (e2fsck -fn，仅检查不修改)..."
+        e2fsck -fn "$img_file" >/dev/null 2>&1 || true
+    fi
+
+    # 挂载
+    local mounted=false
+    local loop_dev=""
+
+    if mount -o loop "$img_file" "$mount_point" 2>/dev/null; then
+        mounted=true
+    fi
+
+    # 严格模式：冻结后镜像本应可正常可写挂载。挂载失败即说明镜像异常
+    # （撕裂/损坏），判为失败上抛，由调用方回滚——不做 e2fsck 修复后重试。
+    if [ "$mounted" = false ]; then
+        log_error "无法挂载镜像（冻结后本应一致，疑似撕裂/损坏）"
+        rmdir "$mount_point"
+        return 1
+    fi
+
+    # 检测 overlay 结构: 实际文件在 rw_upper/ 中
+    local clean_root="$mount_point"
+    if [ -d "${mount_point}/rw_upper" ]; then
+        clean_root="${mount_point}/rw_upper"
+        log_info "  检测到 overlay 结构，清理目标: rw_upper/"
+    fi
+
+    local cleaned=0
+
+    # 1. 清理 /media/ 下的内容
+    if [ -d "${clean_root}/media" ]; then
+        log_info "  清理 /media/ ..."
+        find "${clean_root}/media" -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+        cleaned=$((cleaned + 1))
+    fi
+
+    # 2. 清理 /tmp/
+    if [ -d "${clean_root}/tmp" ]; then
+        log_info "  清理 /tmp/ ..."
+        find "${clean_root}/tmp" -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+        cleaned=$((cleaned + 1))
+    fi
+
+    # 3. 清理其他临时文件
+    for d in var/tmp var/cache; do
+        if [ -d "${clean_root}/${d}" ]; then
+            log_info "  清理 /${d}/ ..."
+            find "${clean_root}/${d}" -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+            cleaned=$((cleaned + 1))
+        fi
+    done
+
+    # 4. 清理日志文件
+    if [ -d "${clean_root}/var/log" ]; then
+        log_info "  清理 /var/log/ ..."
+        find "${clean_root}/var/log" -type f \( -name '*.log' -o -name '*.log.*' -o -name '*.gz' \) -delete 2>/dev/null || true
+        cleaned=$((cleaned + 1))
+    fi
+
+    log_ok "清理了 $cleaned 个目录/类别"
+    sync
+
+    # 卸载
+    umount "$mount_point"
+    rmdir "$mount_point"
+
+    # zerofree 已移除：在 LIVE dd 出来的不一致 image 上 zerofree 可能误判
+    # bitmap，把仍属于文件的块写零，造成备份中 .so 内容变全零。代价是压缩后
+    # 体积可能增加几百 MB（gzip/pigz 处理全零块本来很高效，已分配块的"残余"
+    # 数据反而难压缩）。
+    return 0
+}
+
+# --------------- 恢复操作 ---------------
+do_restore() {
+    local restore_path="$1"
+    local img_file
+    local md5_file
+    
+    # 查找镜像文件
+    if [ -f "$restore_path" ]; then
+        img_file="$restore_path"
+    elif [ -d "$restore_path" ]; then
+        # 查找目录中的 .img.gz 文件
+        local -a img_list
+        mapfile -t img_list < <(ls -t "$restore_path"/*.img.gz 2>/dev/null)
+        
+        if [ ${#img_list[@]} -eq 0 ]; then
+            log_error "目录中未找到 .img.gz 文件: $restore_path"
+            exit 1
+        elif [ ${#img_list[@]} -eq 1 ]; then
+            img_file="${img_list[0]}"
+            log_info "找到镜像: $img_file"
+        else
+            log_info "找到 ${#img_list[@]} 个镜像文件（按时间排序）:"
+            for i in "${!img_list[@]}"; do
+                local fsize
+                fsize=$(ls -lh "${img_list[$i]}" | awk '{print $5}')
+                local ftime
+                ftime=$(stat -c '%y' "${img_list[$i]}" | cut -d. -f1)
+                echo "  [$((i+1))] ${img_list[$i]##*/}  ($fsize, $ftime)"
+            done
+            read -p "请选择 [1-${#img_list[@]}]: " choice
+            if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#img_list[@]} ]; then
+                log_error "无效选择"
+                exit 1
+            fi
+            img_file="${img_list[$((choice-1))]}"
+        fi
+    else
+        log_error "路径不存在: $restore_path"
+        exit 1
+    fi
+    
+    md5_file="${img_file}.md5"
+    
+    log_info "=========================================="
+    log_info "恢复 $img_file -> Slot $INACTIVE_SLOT"
+    log_info "=========================================="
+    
+    # 检查非活动分区是否被挂载
+    if check_partition_mounted "$INACTIVE_PART"; then
+        log_warn "非活动分区 $INACTIVE_PART 已挂载，尝试卸载..."
+        umount "$INACTIVE_PART" || {
+            log_error "无法卸载 $INACTIVE_PART，请手动卸载后重试"
+            exit 1
+        }
+        log_ok "卸载成功"
+    fi
+    
+    # MD5 校验
+    if [ -f "$md5_file" ]; then
+        log_info "验证 MD5 校验值..."
+        local expected_md5
+        expected_md5=$(cat "$md5_file" | awk '{print $1}')
+        local actual_md5
+        actual_md5=$($MD5SUM "$img_file" | awk '{print $1}')
+        
+        if [ "$expected_md5" = "$actual_md5" ]; then
+            log_ok "MD5 校验通过: $actual_md5"
+        else
+            log_error "MD5 校验失败!"
+            log_error "  期望: $expected_md5"
+            log_error "  实际: $actual_md5"
+            exit 1
+        fi
+    else
+        log_warn "未找到 MD5 文件 ($md5_file)，跳过校验"
+        read -p "是否继续? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    fi
+    
+    # 获取镜像大小
+    local img_size
+    img_size=$(ls -lh "$img_file" | awk '{print $5}')
+    log_info "镜像大小: $img_size"
+    
+    # 确认操作
+    log_warn "即将写入 $INACTIVE_PART (Slot $INACTIVE_SLOT)"
+    log_warn "此操作将覆盖该分区所有数据!"
+    read -p "确认继续? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "操作已取消"
+        exit 0
+    fi
+    
+    # 开始恢复
+    log_info "开始恢复..."
+    local start_time
+    start_time=$(date +%s)
+    
+    if [ -n "$PIGZ" ]; then
+        if [ -n "$PV" ]; then
+            $PIGZ -dc "$img_file" | $PV | $DD of="$INACTIVE_PART" bs=4M status=none
+        else
+            $PIGZ -dc "$img_file" | $DD of="$INACTIVE_PART" bs=4M status=progress
+        fi
+    else
+        gzip -dc "$img_file" | $DD of="$INACTIVE_PART" bs=4M status=progress
+    fi
+    
+    # 同步
+    log_info "同步磁盘..."
+    sync
+    
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    log_ok "=========================================="
+    log_ok "恢复完成!"
+    log_ok "  目标分区: $INACTIVE_PART (Slot $INACTIVE_SLOT)"
+    log_ok "  耗时: ${duration}秒"
+    log_ok "=========================================="
+
+    # bsp_param 默认不恢复（保留 BSP 提供的当前状态）；--with-bsp-param 才尝试
+    if [ "${WITH_BSP_PARAM:-false}" = true ]; then
+        restore_bsp_param "$img_file"
+    else
+        local bp_sibling="${img_file%.img.gz}${BSP_PARAM_SUFFIX}"
+        if [ -f "$bp_sibling" ]; then
+            log_info "检测到伴生 bsp_param 备份 ($bp_sibling)，但未指定 --with-bsp-param，跳过"
+        fi
+    fi
+
+    # 软链接目标目录的创建/owner 修复已交由开机服务
+    # tars-init-user-partition.service（/usr/local/bin/tars_init_user_partition）
+    # 统一负责，恢复后首次启动即生效，故此处不再重复处理。
+
+    # 切换 slot 并重启
+    switch_and_reboot
+}
+
+# --------------- 恢复 bsp_param (vblkdev73) ---------------
+# 仅在显式 --with-bsp-param 时调用。从 res 备份旁边的伴生文件读取，
+# 校验 MD5（如有），写入原 raw partition。
+restore_bsp_param() {
+    local res_file="$1"
+    local bp_file="${res_file%.img.gz}${BSP_PARAM_SUFFIX}"
+    local bp_md5="${bp_file}.md5"
+
+    log_info "------ 恢复 bsp_param ($BSP_PARAM_PART) ------"
+    if [ ! -f "$bp_file" ]; then
+        log_warn "未找到伴生 bsp_param 备份: $bp_file，跳过"
+        return 0
+    fi
+    if [ ! -b "$BSP_PARAM_PART" ]; then
+        log_warn "未找到目标分区 $BSP_PARAM_PART，跳过"
+        return 0
+    fi
+
+    if [ -f "$bp_md5" ]; then
+        local expected actual
+        expected=$(awk '{print $1}' "$bp_md5")
+        actual=$($MD5SUM "$bp_file" | awk '{print $1}')
+        if [ "$expected" != "$actual" ]; then
+            log_error "bsp_param MD5 校验失败 ($expected vs $actual)，中止恢复 bsp_param"
+            return 1
+        fi
+        log_ok "bsp_param MD5 校验通过"
+    else
+        log_warn "无 MD5 文件，跳过 bsp_param 校验"
+    fi
+
+    log_warn "即将写入 $BSP_PARAM_PART (bsp_param raw partition)"
+    read -p "确认恢复 bsp_param? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "已跳过 bsp_param 恢复"
+        return 0
+    fi
+
+    if [ -n "$PIGZ" ]; then
+        $PIGZ -dc "$bp_file" | $DD of="$BSP_PARAM_PART" bs=4M status=none
+    else
+        gzip -dc "$bp_file" | $DD of="$BSP_PARAM_PART" bs=4M status=none
+    fi
+    sync
+    log_ok "bsp_param 恢复完成"
+}
+
+# --------------- 切换 Slot 并重启 ---------------
+switch_and_reboot() {
+    log_info "准备切换到 Slot $INACTIVE_SLOT..."
+    
+    # 使用 switch_slot 切换分区，传入目标 slot 参数
+    if ! command -v switch_slot &>/dev/null; then
+        log_warn "未找到 switch_slot 命令"
+        log_info "请手动执行 switch_slot $INACTIVE_SLOT 后重启"
+        return 1
+    fi
+    
+    log_info "执行: switch_slot $INACTIVE_SLOT"
+    if switch_slot "$INACTIVE_SLOT"; then
+        log_ok "Slot 切换成功 -> Slot $INACTIVE_SLOT"
+    else
+        log_error "Slot 切换失败"
+        return 1
+    fi
+
+    if [ "${NO_REBOOT:-false}" = true ]; then
+        log_info "已指定 --no-reboot，跳过重启。下次启动将进入 Slot $INACTIVE_SLOT"
+        return 0
+    fi
+    
+    log_warn "系统将在 5 秒后重启..."
+    log_warn "按 Ctrl+C 取消"
+    sleep 5
+    
+    log_info "正在重启..."
+    /usr/bin/reboot
+}
+
+# --------------- 使用帮助 ---------------
+usage() {
+    cat << EOF
+用法: $0 [选项] <路径>
+
+选项:
+    -b, --backup  <path>    备份当前分区到指定路径
+                            （同时自动备份 bsp_param 到 <res>.bsp_param.img.gz）
+    -r, --restore <path>    从指定路径恢复到非活动分区
+                            默认仅恢复 res，不写 bsp_param
+    --with-bsp-param        与 -r 配合：同时把伴生 bsp_param 备份写回
+                            /dev/vblkdev73（需要确认）
+    --no-reboot             与 -r 配合：切换 slot 后不重启
+    -h, --help              显示此帮助信息
+
+示例:
+    $0 -b /media/sda_udisk/                    # 备份到 USB，自动生成文件名
+    $0 -b /media/sda_udisk/my_backup.img.gz    # 备份到指定文件
+    $0 -r /media/sda_udisk/my_backup.img.gz    # 仅恢复 res
+    $0 -r /media/sda_udisk/                    # 从目录中最新镜像恢复
+    $0 -r /media/sda_udisk/foo.img.gz --with-bsp-param   # 同时恢复 bsp_param
+    $0 -r /media/sda_udisk/foo.img.gz --no-reboot        # 刷写后不重启
+
+分区布局:
+    vblkdev80p9  = Slot A (res_a)
+    vblkdev80p10 = Slot B (res_b)
+    vblkdev73    = bsp_param (16 MiB raw, 默认仅备份不恢复)
+
+备份操作:
+    - 读取当前活动分区的完整块数据
+    - 使用 pigz 并行压缩 (如可用)
+    - 生成 .md5 校验文件
+    - 顺手导出 vblkdev73 (bsp_param) 为伴生文件
+
+恢复操作:
+    - 验证 MD5 校验值
+    - 写入非活动分区
+    - 不写 bsp_param（除非显式 --with-bsp-param）
+    - 自动切换 slot 并重启（可用 --no-reboot 跳过重启）
+EOF
+}
+
+# --------------- 主程序 ---------------
+main() {
+    # 检查 root 权限
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "需要 root 权限运行此脚本"
+        exit 1
+    fi
+    
+    # 解析参数
+    local action=""
+    local target_path=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b|--backup)
+                action="backup"
+                shift
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    target_path="$1"
+                    shift
+                fi
+                ;;
+            -r|--restore)
+                action="restore"
+                shift
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    target_path="$1"
+                    shift
+                fi
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --with-bsp-param)
+                WITH_BSP_PARAM=true
+                shift
+                ;;
+            --no-reboot)
+                NO_REBOOT=true
+                shift
+                ;;
+            *)
+                if [ -z "$target_path" ]; then
+                    target_path="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # 验证参数
+    if [ -z "$action" ]; then
+        log_error "请指定操作: -b (备份) 或 -r (恢复)"
+        usage
+        exit 1
+    fi
+    
+    if [ -z "$target_path" ]; then
+        log_error "请指定路径"
+        usage
+        exit 1
+    fi
+    
+    # 初始化
+    detect_tools
+    detect_current_slot
+    
+    # 执行操作
+    case "$action" in
+        backup)
+            do_backup "$target_path"
+            ;;
+        restore)
+            do_restore "$target_path"
+            ;;
+    esac
+}
+
+main "$@"

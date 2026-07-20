@@ -173,7 +173,7 @@ prompt_power_cycle_if_firmware_flashed() {
     if [ "$USE_DEFAULT_OPTIONS" -eq 1 ]; then
         echo -e "${YELLOW}是否对整机重新上下电使新固件生效? [默认模式: Y]${NO_COLOR}"
         echo -e "${GREEN}请对整机做一次完整上下电，然后再重新运行本脚本。${NO_COLOR}"
-        exit 0
+        return 1
     else
         local power_choice=""
         read -p "$(echo -e "${YELLOW}是否对整机重新上下电使新固件生效? [Y/n]: ${NO_COLOR}")" power_choice
@@ -185,7 +185,7 @@ prompt_power_cycle_if_firmware_flashed() {
                 ;;
             * )
                 echo -e "${GREEN}请对整机做一次完整上下电，然后再重新运行本脚本。${NO_COLOR}"
-                exit 0
+                return 1
                 ;;
         esac
     fi
@@ -500,4 +500,5 @@ if [ "$_pmu_fw_check_rc" -ne 0 ]; then
 fi
 
 echo -e "${GREEN}✅ 全部固件校验通过${NO_COLOR}"
-exit 0
+prompt_power_cycle_if_firmware_flashed
+exit $?  # 返回上一个命令的实际退出码

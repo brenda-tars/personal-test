@@ -24,8 +24,8 @@ GREEN='\033[32m'
 WHITE='\033[34m'
 YELLOW='\033[33m'
 NO_COLOR='\033[0m'
-USE_DEFAULT_OPTIONS=1   # 1: 后续交互项自动使用各自默认值
-CHECK_ONLY=0            # 1: 仅检测版本，不下载/不刷写/不 apply（--check-only）
+USE_DEFAULT_OPTIONS=0   # 1: 后续交互项自动使用各自默认值
+CHECK_ONLY=0            # 1: 仅检测版本，不下载/不刷写（--check-only）
 PACKAGE_DIR="/mnt/gaea/package"
 OTA_FILE="$(dirname "${BASH_SOURCE[0]}")/firmware_ota.py"
 if [ ! -f "$OTA_FILE" ]; then
@@ -49,7 +49,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  --use-default   后续交互项自动使用各自默认值"
-    echo "  --check-only    仅检测版本，不下载/不刷写/不 apply（别名 --no-download）"
+    echo "  --check-only    仅检测版本，不下载/不刷写（别名 --no-download）"
     echo "  -h, --help      显示帮助信息"
 }
 
